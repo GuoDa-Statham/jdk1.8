@@ -524,6 +524,7 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
      */
     private long completedTaskCount;
 
+
     /*
      * All user control parameters are declared as volatiles so that
      * ongoing actions are based on freshest values, but without need
