@@ -323,12 +323,21 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
      *   workerCount, indicating the effective number of threads
      *   runState,    indicating whether running, shutting down etc
      *
+     * 主线程池的控制状态ctl是一个包含两个属性字段的原子性整数：
+     *  workerCount  有效线程数
+     *  runState    线程池状态  高位存储
+     *
+     *
      * In order to pack them into one int, we limit workerCount to
      * (2^29)-1 (about 500 million) threads rather than (2^31)-1 (2
      * billion) otherwise representable. If this is ever an issue in
      * the future, the variable can be changed to be an AtomicLong,
      * and the shift/mask constants below adjusted. But until the need
      * arises, this code is a bit faster and simpler using an int.
+     *
+     * 为了把他们压缩成int,我们将workerCount限制为(2^29)-1(大约5亿)个线程，而不是(2^31)-1(20亿)个线程
+     * 如果将来出现长度的问题，可以将变量更改为AtomicLong，并调整下面的shift/mask常量。
+     * 但是在需要之前，使用int可以使这段代码更快更简单。
      *
      * The workerCount is the number of workers that have been
      * permitted to start and not permitted to stop.  The value may be
@@ -337,6 +346,10 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
      * asked, and when exiting threads are still performing
      * bookkeeping before terminating. The user-visible pool size is
      * reported as the current size of the workers set.
+     *
+     * workerCount是允许开始和禁止开始的worker数量。该值可能与实际的活动线程数暂时不同，
+     * 例如，当ThreadFactory在被请求时无法创建线程，以及退出的线程在终止前仍在执行记帐时。
+     * 用户可见的池大小就是为worker集的当前大小。
      *
      * The runState provides the main lifecycle control, taking on values:
      *
@@ -348,6 +361,13 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
      *             the thread transitioning to state TIDYING
      *             will run the terminated() hook method
      *   TERMINATED: terminated() has completed
+     *
+     *   runState 提供主要的生命周期控制，具有以下值:
+     *      RUNNING：接受一个新任务，并执行队列任务
+     *      SHUTDOWN：不接受新任务，但是处理排队的任务
+     *      STOP：不接受新任务，不处理队列任务，终止执行中的任务
+     *      TIDYING：所有任务终止，workerCount为0，转为TIDYING状态的线程将调用terminated()狗子方法
+     *      TREMINATED：terminated()已经执行完
      *
      * The numerical order among these values matters, to allow
      * ordered comparisons. The runState monotonically increases over
@@ -364,8 +384,23 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
      * TIDYING -> TERMINATED
      *    When the terminated() hook method has completed
      *
+     *  为了允许有序比较，这些值之间的数值顺序很重要。运行状态会随着时间单调地增加，但不需要达到每个状态。转换:
+     *  RUNNING -> SHUTDOWN
+     *      在调用shutdown()时，可能隐式地在finalize()中调用
+     *  (RUNNING or SHUTDOWN) -> STOP
+     *      在调用shutdown时
+     *   SHUTDOWN -> TIDYING
+     *      当队列和线程池为空的时候
+     *   STOP -> TIDYING
+     *      当线程池为空
+     *   TIDYING -> TERMINATED
+     *      当terminated()方法完成时
+     *
+     *
      * Threads waiting in awaitTermination() will return when the
      * state reaches TERMINATED.
+     * 当状态达到终止时，在awaitterminate()中等待的线程将返回。
+     *
      *
      * Detecting the transition from SHUTDOWN to TIDYING is less
      * straightforward than you'd like because the queue may become
@@ -373,12 +408,19 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
      * we can only terminate if, after seeing that it is empty, we see
      * that workerCount is 0 (which sometimes entails a recheck -- see
      * below).
+     *
+     * 检测从SHUTDOWN到TIDYING 没有想象那么简单。在SHUTDOWN状态时，队列可能为空，也有可能非空。
+     * 但是我们可以终止他，如果看见它是空的，且workerCount=0（有时需要重新检查--如下）
+     *
      */
     private final AtomicInteger ctl = new AtomicInteger(ctlOf(RUNNING, 0));
     private static final int COUNT_BITS = Integer.SIZE - 3;
+
+    // 2^29  536870911
     private static final int CAPACITY   = (1 << COUNT_BITS) - 1;
 
     // runState is stored in the high-order bits
+    // 左移 29 位
     private static final int RUNNING    = -1 << COUNT_BITS;
     private static final int SHUTDOWN   =  0 << COUNT_BITS;
     private static final int STOP       =  1 << COUNT_BITS;
@@ -387,6 +429,7 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
 
     // Packing and unpacking ctl
     private static int runStateOf(int c)     { return c & ~CAPACITY; }
+    // 计算workerCount
     private static int workerCountOf(int c)  { return c & CAPACITY; }
     private static int ctlOf(int rs, int wc) { return rs | wc; }
 
@@ -1341,6 +1384,9 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
          * workerCount, and so prevents false alarms that would add
          * threads when it shouldn't, by returning false.
          *
+         * 如果少于核心线程数，则开启一个新的线程去处理这个任务。对addWorker的调用
+         * 原子性检查runState和workerCount，这样可以通过返回false避免这个不应该创建线程却创建了线程的错误警告
+         *
          * 2. If a task can be successfully queued, then we still need
          * to double-check whether we should have added a thread
          * (because existing ones died since last checking) or that
@@ -1348,23 +1394,33 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
          * recheck state and if necessary roll back the enqueuing if
          * stopped, or start a new thread if there are none.
          *
+         * 如果一个人任务成功放入队列，那么我们仍然需要再次检查我们是否应该新创建线程
+         * （因为自上次检查，存在一个线程人销毁） 或者 线程池在进入这个方法之后被关闭
+         *
          * 3. If we cannot queue task, then we try to add a new
          * thread.  If it fails, we know we are shut down or saturated
          * and so reject the task.
+         *
+         *如果无法对任务排队，则尝试添加新线程。如果它失败了，我们知道我们被关闭或饱和，所以拒绝任务。
          */
         int c = ctl.get();
+        /** 小于核心线程数，新建一个核心线程**/
         if (workerCountOf(c) < corePoolSize) {
             if (addWorker(command, true))
                 return;
             c = ctl.get();
         }
+        /** 大于核心线程，则放入队列中**/
         if (isRunning(c) && workQueue.offer(command)) {
+
+            /** 中心检查线程池状况 **/
             int recheck = ctl.get();
             if (! isRunning(recheck) && remove(command))
-                reject(command);
+                rejec   t(command);
             else if (workerCountOf(recheck) == 0)
                 addWorker(null, false);
         }
+        /** 放入队列失败后，才会新建一个非核心线程。 **/
         else if (!addWorker(command, false))
             reject(command);
     }
